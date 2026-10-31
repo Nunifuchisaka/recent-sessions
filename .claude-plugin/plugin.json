@@ -1,0 +1,6 @@
+{
+  "name": "recent-sessions",
+  "version": "0.1.0",
+  "description": "最近使ったセッションの一覧をチャット横のパネルに表示する",
+  "types": "./types/index.d.ts"
+}
