@@ -12,6 +12,7 @@ declare module 'claude-code' {
     'recent-sessions': {
       sessions: Shaped<SessionRow[]>
       error: string | null
+      fetchedAt: number | null
     }
   }
 }

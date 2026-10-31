@@ -76,7 +76,9 @@ test('a failed list_sessions call is shown, not swallowed', async ($, on) => {
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ text: /一覧を更新できません（再試行中）/ })).toBeDefined()
   expect(await ui.find({ text: /server not found/ })).toBeDefined()
+  expect(await ui.find({ text: /他のセッションはありません/ })).toBeUndefined()
   await ui.unmount()
 })
 
@@ -92,7 +94,8 @@ test('with no other sessions the pane says so', async ($, on) => {
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text' }))?.text).toBe('他のセッションはありません')
+  expect(await ui.find({ text: /他のセッションはありません/ })).toBeDefined()
+  expect(await ui.find({ text: /最近の使用 · 0 件/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -174,4 +177,140 @@ test('a failed open is told with a toast', async ($, on) => {
   await ui.unmount()
 
   expect(toasts).toEqual(['セッションを開けませんでした（終了コード 1）'])
+})
+
+const reply = (rows: unknown) => ({
+  value: { content: [{ type: 'text', text: JSON.stringify(rows) }], isError: false },
+})
+const refuse = (text: string) => ({ value: { content: [{ type: 'text', text }], isError: true } })
+
+test('a failed first fetch is retried after 3 seconds and the error clears', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let calls = 0
+  on('command.register', () => ({ value: { command: 'recent-sessions' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('mcp.call', () => {
+    calls += 1
+
+    return calls === 1 ? refuse('not connected yet') : reply(ROWS)
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(2999)
+  expect(calls).toBe(1)
+  await clock.advance(1)
+  expect(calls).toBe(2)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ text: /再試行中/ })).toBeUndefined()
+  expect(await ui.find({ text: /not connected yet/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'local_a' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('repeated failures back off 3s, 5s, 10s, then 30s', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let calls = 0
+  on('command.register', () => ({ value: { command: 'recent-sessions' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('mcp.call', () => {
+    calls += 1
+
+    return refuse('down')
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(calls).toBe(1)
+  await clock.advance(3000)
+  expect(calls).toBe(2)
+  await clock.advance(5000)
+  expect(calls).toBe(3)
+  await clock.advance(10000)
+  expect(calls).toBe(4)
+  await clock.advance(29999)
+  expect(calls).toBe(4)
+  await clock.advance(1)
+  expect(calls).toBe(5)
+})
+
+test('a failed refresh keeps the previous list and adds one error line', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let calls = 0
+  on('command.register', () => ({ value: { command: 'recent-sessions' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('mcp.call', () => {
+    calls += 1
+
+    return calls === 1 ? reply(ROWS) : refuse('server went away')
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(30000)
+  expect(calls).toBe(2)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Button', key: 'local_a' })).toBeDefined()
+  expect(await ui.find({ text: /雑談メモ/ })).toBeDefined()
+  expect(await ui.find({ text: /一覧を更新できません（再試行中）: server went away/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the header shows the count and the last update time', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('command.register', () => ({ value: { command: 'recent-sessions' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('mcp.call', () => reply(ROWS))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ text: /最近の使用 · 2 件/ })).toBeDefined()
+  expect(await ui.find({ text: /更新 \d{2}:\d{2}/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('long titles are cut to the pane width with an ellipsis', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('command.register', () => ({ value: { command: 'recent-sessions' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('mcp.call', () => reply([{ ...ROWS[0], title: 'あ'.repeat(40) }]))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const button = await ui.find({ type: 'Button', key: 'local_a' })
+  expect(button?.text).toMatch(/^あ{18}…$/)
+  await ui.unmount()
+})
+
+test('only as many rows as fit the pane height are drawn', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const many = Array.from({ length: 10 }, (_, i) => ({
+    ...ROWS[0],
+    sessionId: `s${i}`,
+    title: `行${i}`,
+    lastActivityAt: `2026-10-31T08:5${i}:00.000Z`,
+  }))
+  on('command.register', () => ({ value: { command: 'recent-sessions' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('mcp.call', () => reply(many))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  // bodyRows 11: ヘッダー 2 行を除いた 9 行に 3 件
+  const ui = await $.ui.mount({
+    ...PANE,
+    props: { ...PANE.props, scroll: { offset: 0, bodyRows: 11 } },
+    surface: 'terminal',
+  })
+  expect(await ui.find({ type: 'Button', key: 's9' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 's7' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 's6' })).toBeUndefined()
+  await ui.unmount()
 })
